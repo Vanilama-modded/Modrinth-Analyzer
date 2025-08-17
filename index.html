@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Modrinth Analytics Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg2: #f1f5f9;
+      --text: #111827;
+      --card: #ffffff;
+      --border: #e5e7eb;
+      --accent: #10b981;
+    }
+    [data-theme="dark"] {
+      --bg: #111827;
+      --bg2: #1f2937;
+      --text: #f9fafb;
+      --card: #1f2937;
+      --border: #374151;
+      --accent: #34d399;
+    }
+    body {
+      margin: 0;
+      padding: 1.5rem;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, sans-serif;
+      transition: background .3s, color .3s;
+    }
+    h1 { margin-top: 0; }
+    label { display:block; margin:.5rem 0 .2rem; font-weight:600 }
+    select, input {
+      width: 100%; max-width: 300px; padding: .5rem;
+      border: 1px solid var(--border); border-radius: .3rem;
+      background: var(--card); color: var(--text);
+    }
+    button {
+      padding: .55rem 1rem; background: var(--accent); color: #fff;
+      border: none; border-radius: .3rem; cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: .5rem .8rem; align-items: center;
+      margin-bottom: 1rem;
+    }
+    .error { color: #ef4444; margin: .5rem 0 }
+    .grid {
+      display: grid; gap: 1rem;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: .4rem; padding: 1rem;
+    }
+    .card h3 { margin: 0 0 .5rem; display: flex; align-items: center; gap: .4rem }
+    .stat { display:flex; justify-content:space-between; margin:.25rem 0 }
+    .hidden { display: none }
+  </style>
+</head>
+<body>
+
+  <h1><i class="fas fa-chart-line"></i> Modrinth Analytics Dashboard</h1>
+
+  <div class="toolbar">
+    <label for="token">Access Token (stored locally):</label>
+    <input id="token" type="password" placeholder="Paste your Modrinth token"/>
+
+    <button id="loadBtn"><i class="fas fa-sync-alt"></i> Load Projects</button>
+
+    <label for="currency">Currency:</label>
+    <select id="currency">
+      <option value="USD">USD</option>
+      <option value="EUR">EUR</option>
+      <option value="GBP">GBP</option>
+      <option value="CAD">CAD</option>
+      <option value="AUD">AUD</option>
+    </select>
+
+    <button id="themeToggle" title="Toggle dark mode">
+      <i class="fas fa-moon"></i>
+    </button>
+  </div>
+
+  <div class="error" id="error"></div>
+
+  <label for="projectSelect">Project:</label>
+  <select id="projectSelect">
+    <option value="__account__">
+      <i class="fas fa-globe"></i> Account Total (all projects)
+    </option>
+  </select>
+
+  <div id="analytics" class="grid hidden"></div>
+
+  <script>
+  const API = 'https://api.modrinth.com/v2';
+  const EXCHANGE_API = 'https://api.exchangerate-api.com/v4/latest/USD';
+  const CENTS = 100;
+
+  const tokenInput  = document.getElementById('token');
+  const loadBtn     = document.getElementById('loadBtn');
+  const projectSel  = document.getElementById('projectSelect');
+  const analyticsEl = document.getElementById('analytics');
+  const errorBox    = document.getElementById('error');
+  const currencySel = document.getElementById('currency');
+  const themeBtn    = document.getElementById('themeToggle');
+
+  /* ------ Settings ------ */
+  const settings = JSON.parse(localStorage.getItem('settings') || '{}');
+  tokenInput.value = localStorage.getItem('modrinthToken') || '';
+  currencySel.value = settings.currency || 'USD';
+
+  applyTheme(settings.theme || 'light');
+  themeBtn.onclick = () => {
+    const newTheme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(newTheme);
+    storeSettings();
+  };
+  currencySel.onchange = storeSettings;
+  function storeSettings() {
+    localStorage.setItem('settings', JSON.stringify({
+      theme: document.documentElement.getAttribute('data-theme'),
+      currency: currencySel.value
+    }));
+  }
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    themeBtn.innerHTML = t === 'dark'
+      ? '<i class="fas fa-sun"></i>'
+      : '<i class="fas fa-moon"></i>';
+  }
+
+  /* ------ Helpers ------ */
+  function err(msg) { errorBox.textContent = msg; }
+  function clearErr() { errorBox.textContent = ''; }
+  async function get(url) {
+    const res = await fetch(url, {
+      headers: { Authorization: tokenInput.value.trim() }
+    });
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    return res.json();
+  }
+
+  /* ------ Exchange ------ */
+  let rates = { USD: 1 };
+  fetch(EXCHANGE_API)
+    .then(r => r.json())
+    .then(data => rates = data.rates)
+    .catch(() => rates = { USD: 1 });
+
+  function convert(amount, to) {
+    if (to === 'USD') return amount;
+    return (amount * (rates[to] || 1)).toFixed(2);
+  }
+
+  /* ------ Projects ------ */
+  loadBtn.onclick = async () => {
+    const token = tokenInput.value.trim();
+    if (!token) { err('Enter a token'); return; }
+    localStorage.setItem('modrinthToken', token);
+    clearErr();
+    loadBtn.disabled = true;
+    try {
+      const userId = await getUserId();
+      const projects = await get(`${API}/user/${userId}/projects`);
+      projectSel.innerHTML = '<option value="__account__">' +
+        '<i class="fas fa-globe"></i> Account Total (all projects)</option>';
+      projects.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.title;
+        projectSel.appendChild(opt);
+      });
+      await loadAnalytics();
+    } catch (e) {
+      err(e.message);
+    } finally {
+      loadBtn.disabled = false;
+    }
+  };
+  async function getUserId() {
+    const user = await get(`${API}/user`);
+    return user.id;
+  }
+
+  /* ------ Analytics ------ */
+  projectSel.onchange = loadAnalytics;
+
+  async function loadAnalytics() {
+    analyticsEl.classList.add('hidden');
+    clearErr();
+    const currency = currencySel.value;
+    const projectId = projectSel.value;
+
+    try {
+      const projects = projectId === '__account__'
+        ? await get(`${API}/user/${await getUserId()}/projects`)
+        : [{ id: projectId }];
+
+      let dl30 = 0, dl90 = 0, dlTotal = 0;
+      let pv30 = 0, pv90 = 0, pvTotal = 0;
+      let rev30 = 0, rev90 = 0, revTotal = 0;
+
+      await Promise.all(projects.map(async p => {
+        const [dl, pv, rev] = await Promise.all([
+          get(`${API}/project/${p.id}/analytics/download`),
+          get(`${API}/project/${p.id}/analytics/view`),
+          get(`${API}/project/${p.id}/analytics/revenue`).catch(() => null)
+        ]);
+        dl30 += dl.thirty_days || 0;
+        dl90 += dl.ninety_days || 0;
+        dlTotal += dl.total || 0;
+        pv30 += pv.thirty_days || 0;
+        pv90 += pv.ninety_days || 0;
+        pvTotal += pv.total || 0;
+        if (rev) {
+          rev30 += rev.thirty_days || 0;
+          rev90 += rev.ninety_days || 0;
+          revTotal += rev.total || 0;
+        }
+      }));
+
+      analyticsEl.innerHTML = '';
+      analyticsEl.appendChild(card('Downloads',
+        ['Last 30 days', dl30],
+        ['Last 90 days', dl90],
+        ['All time', dlTotal]
+      ));
+      analyticsEl.appendChild(card('Page Views',
+        ['Last 30 days', pv30],
+        ['Last 90 days', pv90],
+        ['All time', pvTotal]
+      ));
+      if (revTotal) {
+        analyticsEl.appendChild(card(`Revenue (${currency})`,
+          ['Last 30 days', '$' + convert(rev30 / CENTS, currency)],
+          ['Last 90 days', '$' + convert(rev90 / CENTS, currency)],
+          ['All time', '$' + convert(revTotal / CENTS, currency)]
+        ));
+      }
+      analyticsEl.classList.remove('hidden');
+    } catch (e) {
+      err(e.message);
+    }
+  }
+
+  function card(title, ...stats) {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = `
+      <h3><i class="fas fa-chart-bar"></i> ${title}</h3>
+      ${stats.map(([k,v]) => `<div class="stat"><span>${k}:</span> <span>${v}</span></div>`).join('')}
+    `;
+    return div;
+  }
+
+  // Auto-load if token saved
+  if (tokenInput.value.trim()) loadBtn.click();
+  </script>
+</body>
+</html>
